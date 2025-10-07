@@ -48,6 +48,8 @@ def test_swiglu(numpy_snapshot, ts_state_dict, in_embeddings, d_model, d_ff):
     # reference_weights = torch.load(FIXTURES_PATH / "positionwise_feedforward_weights.pt")
     w1_weight, w2_weight, w3_weight = [ts_state_dict[0][f"layers.0.ffn.{k}.weight"] for k in ["w1", "w2", "w3"]]
 
+    print(w1_weight.shape, w2_weight.shape, w3_weight.shape)
+
     actual_output = run_swiglu(
         d_model=d_model,
         d_ff=d_ff,

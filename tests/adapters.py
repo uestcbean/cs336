@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import os
-from typing import IO, Any, BinaryIO
+from typing import IO, Any, BinaryIO, Optional
 from collections.abc import Iterable
 from jaxtyping import Float, Int
 
 import numpy.typing as npt
 import torch
 from torch import Tensor
+from cs336_basics.Linear import Linear
+from cs336_basics.Embedding import Embedding
 
 
 
@@ -29,9 +31,9 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
-    raise NotImplementedError
-
+    model = Linear(d_in, d_out)
+    model.weight.data.copy_(weights)
+    return model(in_features)
 
 def run_embedding(
     vocab_size: int,
@@ -51,8 +53,10 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    raise NotImplementedError
+    model = Embedding(vocab_size, d_model)
+    model.weights.data.copy_(weights)
+    return model(token_ids)
+    
 
 
 def run_swiglu(
@@ -77,14 +81,14 @@ def run_swiglu(
     Returns:
         Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
     """
-    # Example:
-    # If your state dict keys match, you can use `load_state_dict()`
-    # swiglu.load_state_dict(weights)
-    # You can also manually assign the weights
-    # swiglu.w1.weight.data = w1_weight
-    # swiglu.w2.weight.data = w2_weight
-    # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+
+    silu = run_linear(d_model, d_ff, w1_weight, in_features)
+    silu = silu * torch.sigmoid(silu)
+    w3x = run_linear(d_model, d_ff, w3_weight, in_features)
+    temp = silu * w3x
+    out = run_linear(d_ff, d_model, w2_weight, temp)
+    return out
+
 
 
 def run_scaled_dot_product_attention(
@@ -105,7 +109,25 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    d_k = Q.shape[1]
+    d_k = torch.tensor(d_k)
+    scores = (Q @ K.transpose(-2, -1)) / torch.sqrt((d_k))
+    
+    ## 把mask应用到scores上，被masked的位置设为-inf
+    if mask is not None:
+        mast_bool = mask.to(dtype=torch.bool)
+        scores = scores.masked_fill(~mast_bool, float("-inf"))
+    
+    attn = run_softmax(scores, dim=-1)
+
+    # 当某个查询位置对所有键位置的注意力都被屏蔽时（也就是 mask 某一行全是 False），我们需要特殊处理
+    if mask is not None:
+        all_false = (~mask.to(dtype=torch.bool)).all(dim=-1, keepdim=True)
+        attn = torch.where(all_false, torch.zeros_like(attn), attn)
+    
+    out = attn @ V
+
+    return out
 
 
 def run_multihead_self_attention(
@@ -139,7 +161,45 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    *prefix, S, d_in = in_features.shape
+    H = num_heads
+    HD = q_proj_weight.shape[0]
+    assert HD % H == 0, "d_model must be divisible by num_heads"
+    D = HD // H
+
+    Wq = q_proj_weight.reshape(H, D, d_in)
+    Wk = k_proj_weight.reshape(H, D, d_in)
+    Wv = v_proj_weight.reshape(H, D, d_in)
+    Wo = o_proj_weight.reshape(d_model, H, D)
+
+    x = in_features
+
+    ## 做Q,K,V的投影
+    Q = torch.einsum("... s d, h k d -> ... s h k", x, Wq)
+    K = torch.einsum("... s d, h k d -> ... s h k", x, Wk)
+    V = torch.einsum("... s d, h k d -> ... s h k", x, Wv)
+
+    ## 注意力打分(在位置s上对位置t进行打分)
+    scores = torch.einsum("... s h k, ... t h k -> ... h s t", Q, K) / torch.sqrt(torch.tensor(D, dtype=torch.float32))
+
+    ## 因果mask
+    causal_mask = torch.triu(torch.ones(S, S, dtype=torch.bool, device=x.device), diagonal=1)
+
+    ## mask应用到scores上,位置 i 不能看到位置 j (j > i)，确保自回归生成
+    scores = scores.masked_fill(causal_mask, float("-inf"))
+
+    ## 计算attension
+    attn = run_softmax(scores, dim=-1)
+
+    ## attn加权V
+    ctx = torch.einsum("... h s t, ... t h k -> ... s h k", attn, V)
+
+    ## 把多头拼回去
+    out = torch.einsum("... s h k, d h k -> ... s d", ctx, Wo)
+
+    return out
+
+
 
 
 def run_multihead_self_attention_with_rope(
@@ -179,7 +239,51 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    *prefix, S, d_in = in_features.shape
+    H = num_heads
+    HD = q_proj_weight.shape[0]
+    assert HD % H == 0, "d_model must be divisible by num_heads"
+    D = HD // H
+
+    Wq = q_proj_weight.reshape(H, D, d_in)
+    Wk = k_proj_weight.reshape(H, D, d_in)
+    Wv = v_proj_weight.reshape(H, D, d_in)
+    Wo = o_proj_weight.reshape(d_model, H, D)
+
+    x = in_features
+
+    ## 做Q,K,V的投影
+    Q = torch.einsum("... s d, h k d -> ... s h k", x, Wq)
+    K = torch.einsum("... s d, h k d -> ... s h k", x, Wk)
+    V = torch.einsum("... s d, h k d -> ... s h k", x, Wv)
+
+    assert D % 2 == 0, "head_dim must be even for RoPE"
+
+    # RoPE on Q and K (with correct d_k = D)
+    # ensure cache length covers all positions; use provided max_seq_len or max pos + 1
+    rope_max = max(int(max_seq_len), int(token_positions.max().item()) + 1)
+    Q = run_rope(D, theta, rope_max, Q, token_positions)
+    K = run_rope(D, theta, rope_max, K, token_positions)
+
+    ## 注意力打分(在位置s上对位置t进行打分)
+    scores = torch.einsum("... s h k, ... t h k -> ... h s t", Q, K) / torch.sqrt(torch.tensor(D, dtype=torch.float32))
+
+    ## 因果mask
+    causal_mask = torch.triu(torch.ones(S, S, dtype=torch.bool, device=x.device), diagonal=1)
+
+    ## mask应用到scores上,位置 i 不能看到位置 j (j > i)，确保自回归生成
+    scores = scores.masked_fill(causal_mask, float("-inf"))
+
+    ## 计算attension
+    attn = run_softmax(scores, dim=-1)
+
+    ## attn加权V
+    ctx = torch.einsum("... h s t, ... t h k -> ... s h k", attn, V)
+
+    ## 把多头拼回去
+    out = torch.einsum("... s h k, d h k -> ... s d", ctx, Wo)
+
+    return out
 
 
 def run_rope(
@@ -393,7 +497,8 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    output = in_features * torch.sigmoid(in_features)
+    return output
 
 
 def run_get_batch(
@@ -432,7 +537,8 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    exp = torch.exp(in_features - torch.max(in_features, dim=dim, keepdim=True).values)
+    return exp / torch.sum(exp, dim=dim, keepdim=True)
 
 
 def run_cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]) -> Float[Tensor, ""]:
