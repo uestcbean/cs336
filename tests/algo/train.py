@@ -26,6 +26,7 @@ from tests.algo.training import (
     get_batch,
     get_lr_cosine_schedule,
     gradient_clipping,
+    load_checkpoint,
     save_checkpoint,
 )
 
@@ -74,6 +75,10 @@ def main() -> None:
     ).to(cfg.device)
     print(f"Model parameters: {model.num_parameters():,}")
 
+    if cfg.device == "cuda":
+        torch.set_float32_matmul_precision("high")  # 启用 TF32，利用 4090 Tensor Core
+        print("TF32 enabled")
+
     optimizer = AdamW(
         model.parameters(),
         lr=cfg.lr_max,
@@ -82,6 +87,12 @@ def main() -> None:
         weight_decay=cfg.weight_decay,
     )
 
+    # ---- 从 checkpoint 续训 ----
+    start_iter = 0
+    if cfg.ckpt_path.exists():
+        start_iter = load_checkpoint(cfg.ckpt_path, model, optimizer)
+        print(f"Resumed from checkpoint at iter {start_iter}")
+
     # ---- 训练循环 ----
     print(f"\nTraining for {cfg.max_iters} iterations (batch={cfg.batch_size}, ctx={cfg.context_length})...")
     print(f"{'iter':>6} {'lr':>10} {'train_loss':>11} {'valid_loss':>11} {'tok/s':>9}")
@@ -89,9 +100,9 @@ def main() -> None:
 
     t_start = time.time()
     last_log_time = t_start
-    last_log_tokens = 0
+    last_log_tokens = start_iter
 
-    for it in range(cfg.max_iters + 1):
+    for it in range(start_iter, cfg.max_iters + 1):
         # 1. 调整 learning rate
         lr = get_lr_cosine_schedule(
             it=it,
